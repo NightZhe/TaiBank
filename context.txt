@@ -1,0 +1,391 @@
+# RemoteClientApp (Kotlin)
+
+這是一個最小化的 Android 範例專案，用來：
+- 與你自己伺服器的 WebSocket 建立長連線
+- 啟動時回傳裝置資訊（deviceId / ip / model / battery）到伺服器
+- 接收伺服器下發的 JSON 指令，支援至少 `launch`（啟動指定 package） 與 `toast` 指令
+- 以 Foreground Service 維持 WebSocket 背景連線
+
+## 如何使用
+1. 將 `SERVER_WS_URL` 改成你的伺服器 websocket endpoint，例如：`ws://your-server.example:8080/ws`。
+2. 用 Android Studio 開啟整個專案（或用命令行 `./gradlew assembleDebug`）來編譯 APK。
+3. 安裝到手機，開啟 App，允許權限 (INTERNET)。
+
+---
+
+檔案摘要（放在 `app/src/main/...`）：
+
+## settings.gradle
+```
+rootProject.name = "RemoteClientApp"
+include ':app'
+```
+
+## build.gradle (Project)
+```
+// Top-level build file
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath "com.android.tools.build:gradle:8.1.0"
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+```
+
+## app/build.gradle
+```
+plugins {
+    id 'com.android.application'
+    id 'kotlin-android'
+}
+
+android {
+    namespace 'com.example.remoteclient'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.example.remoteclient"
+        minSdk 23
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.12.0'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'com.google.android.material:material:1.9.0'
+    implementation 'com.squareup.okhttp3:okhttp:4.11.0' // 用於 websocket
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+}
+```
+
+## AndroidManifest.xml
+```
+<manifest package="com.example.remoteclient"
+    xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <application
+        android:allowBackup="true"
+        android:label="RemoteClientApp"
+        android:theme="@style/Theme.AppCompat.Light.NoActionBar">
+
+        <activity android:name="com.example.remoteclient.MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name="com.example.remoteclient.WebSocketService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice|dataSync" />
+
+    </application>
+</manifest>
+```
+
+## app/src/main/java/com/example/remoteclient/MainActivity.kt
+```kotlin
+package com.example.remoteclient
+
+import android.content.Intent
+import android.os.Bundle
+import androidx.appcompat.app.AppCompatActivity
+import android.widget.Button
+import android.widget.TextView
+
+class MainActivity : AppCompatActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        val tv = findViewById<TextView>(R.id.status)
+        val btnStart = findViewById<Button>(R.id.btnStart)
+        btnStart.setOnClickListener {
+            val intent = Intent(this, WebSocketService::class.java)
+            startForegroundService(intent)
+            tv.text = "Service started"
+        }
+
+        val btnStop = findViewById<Button>(R.id.btnStop)
+        btnStop.setOnClickListener {
+            val intent = Intent(this, WebSocketService::class.java)
+            stopService(intent)
+            tv.text = "Service stopped"
+        }
+    }
+}
+```
+
+## app/src/main/res/layout/activity_main.xml
+```
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:orientation="vertical"
+    android:padding="24dp"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <TextView
+        android:id="@+id/status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Idle"
+        android:textSize="18sp" />
+
+    <Button
+        android:id="@+id/btnStart"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Start Service" />
+
+    <Button
+        android:id="@+id/btnStop"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Stop Service" />
+
+</LinearLayout>
+```
+
+## app/src/main/java/com/example/remoteclient/WebSocketService.kt
+```kotlin
+package com.example.remoteclient
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Intent
+import android.os.Build
+import android.os.IBinder
+import android.util.Log
+import kotlinx.coroutines.*
+import okhttp3.*
+import org.json.JSONObject
+import java.io.IOException
+
+class WebSocketService : Service() {
+    companion object {
+        private const val TAG = "WebSocketService"
+        // TODO: 改成你的 ws url
+        private const val SERVER_WS_URL = "ws://YOUR_SERVER:8080/ws"
+        private const val CHANNEL_ID = "remote_client_channel"
+    }
+
+    private val client = OkHttpClient()
+    private var ws: WebSocket? = null
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    override fun onCreate() {
+        super.onCreate()
+        startForegroundIfNeeded()
+        connectWebSocket()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        ws?.close(1000, "ServiceDestroyed")
+        scope.cancel()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun startForegroundIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val nm = getSystemService(NotificationManager::class.java)
+            val channel = NotificationChannel(CHANNEL_ID, "RemoteClient", NotificationManager.IMPORTANCE_LOW)
+            nm.createNotificationChannel(channel)
+        }
+        val notif: Notification = Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("RemoteClient")
+            .setContentText("Connected")
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .build()
+        startForeground(1, notif)
+    }
+
+    private fun connectWebSocket() {
+        val req = Request.Builder().url(SERVER_WS_URL).build()
+        ws = client.newWebSocket(req, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                Log.i(TAG, "ws open")
+                sendDeviceInfo()
+            }
+
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                Log.i(TAG, "ws msg: $text")
+                handleServerCommand(text)
+            }
+
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                webSocket.close(1000, null)
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                Log.e(TAG, "ws fail: ${t.message}")
+                scheduleReconnect()
+            }
+        })
+    }
+
+    private fun scheduleReconnect() {
+        scope.launch {
+            delay(5000)
+            connectWebSocket()
+        }
+    }
+
+    private fun sendDeviceInfo() {
+        val json = JSONObject()
+        json.put("device_id", android.os.Build.MODEL ?: "unknown")
+        json.put("android_id", Utils.getAndroidId(this))
+        json.put("ip", Utils.getLocalIpAddress(this))
+        json.put("battery", Utils.getBatteryPercent(this))
+        ws?.send(json.toString())
+    }
+
+    private fun handleServerCommand(msg: String) {
+        try {
+            val jo = JSONObject(msg)
+            val action = jo.optString("action")
+            when (action) {
+                "launch" -> {
+                    val pkg = jo.optString("package")
+                    if (pkg.isNotEmpty()) {
+                        launchApp(pkg)
+                        sendAck(action, true, "launched $pkg")
+                    } else sendAck(action, false, "no package")
+                }
+                "toast" -> {
+                    val t = jo.optString("text")
+                    Utils.showToast(this, t)
+                    sendAck(action, true, "ok")
+                }
+                else -> sendAck(action, false, "unknown action")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "handle fail: ${e.message}")
+        }
+    }
+
+    private fun sendAck(action: String, ok: Boolean, msg: String) {
+        val jo = JSONObject()
+        jo.put("type", "ack")
+        jo.put("action", action)
+        jo.put("ok", ok)
+        jo.put("msg", msg)
+        ws?.send(jo.toString())
+    }
+
+    private fun launchApp(pkg: String) {
+        val pcm = packageManager
+        val intent = pcm.getLaunchIntentForPackage(pkg)
+        if (intent != null) {
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+        } else {
+            // 若無法直接取得啟動 intent，嘗試開啟 package's main activity via am
+            try {
+                Runtime.getRuntime().exec(arrayOf("am", "start", "-n", pkg))
+            } catch (e: Exception) {
+                Log.e(TAG, "am start fail: ${e.message}")
+            }
+        }
+    }
+}
+```
+
+## app/src/main/java/com/example/remoteclient/Utils.kt
+```kotlin
+package com.example.remoteclient
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.net.wifi.WifiManager
+import android.os.BatteryManager
+import android.provider.Settings
+import android.widget.Toast
+
+object Utils {
+    @SuppressLint("HardwareIds")
+    fun getAndroidId(ctx: Context): String {
+        return Settings.Secure.getString(ctx.contentResolver, Settings.Secure.ANDROID_ID) ?: ""
+    }
+
+    fun getLocalIpAddress(ctx: Context): String {
+        return try {
+            val wm = ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val ip = wm.connectionInfo.ipAddress
+            String.format("%d.%d.%d.%d", ip and 0xff, ip shr 8 and 0xff, ip shr 16 and 0xff, ip shr 24 and 0xff)
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    fun getBatteryPercent(ctx: Context): Int {
+        val bm = ctx.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+        val perc = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+        return perc
+    }
+
+    fun showToast(ctx: Context, text: String) {
+        android.os.Handler(ctx.mainLooper).post {
+            Toast.makeText(ctx, text, Toast.LENGTH_SHORT).show()
+        }
+    }
+}
+```
+
+---
+
+## Server side (範例 JSON 指令)
+- 當 client 連線並發上 device info，server 可保存 client id 與 websocket 連線對應。
+- 下發指令範例：
+```json
+{ "action": "launch", "package": "com.kasikornbank.kplus" }
+```
+
+Client 會回傳 ack：
+```json
+{ "type": "ack", "action": "launch", "ok": true, "msg": "launched com.kasikornbank.kplus" }
+```
+
+---
+
+## 注意事項
+1. 若你需要模擬點擊（tap）或更細緻的 UI 操作：建議在手機端加入 `AccessibilityService`，由 server 發指令後在 AccessibilityService 執行模擬點擊。AccessibilityService 實作需用戶手動在系統設定中授權，範例未包含該段以簡化。
+2. 若你希望 server 直接用 `adb` 去連手機（即 server 主動用 adb connect IP:5555）：此方式仍需手機已啟用 adb over tcp（多數裝置第一次需 USB 授權），或手機已透過 VPN/Tailscale 與 server 在同一虛擬網段。
+3. 若需要我們可以把 `launch` 改成執行任意 shell 指令（`am start`、`input tap` 等），但這些指令的成功率與權限相關。非 root 情況下 `input` 可能受限。
+
+---
+
+如果你要，我可以：
+- 幫你把 `AccessibilityService` 的模擬點擊範例加進去（包含如何在 manifest 與設定中啟用）
+- 或把這個專案打成一個可下載的 zip（如果你希望我生成檔案，請告訴我你想要哪些額外功能）
+
+要我先把 AccessibilityService 加上去，還是先讓你拿這個基礎版自己編譯 APK？
