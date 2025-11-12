@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">RemoteClient</string>
+    <string name="accessibility_service_description">允許應用程式執行自動點擊功能</string>
+</resources>
